@@ -5,6 +5,7 @@
 #include <thread>
 #include <vector>
 #include "Eigen-3.3/Eigen/Core"
+#include "Eigen-3.3/Eigen/LU" // for Eigen inverse()
 #include "Eigen-3.3/Eigen/QR"
 #include "MPC.h"
 #include "json.hpp"
@@ -65,6 +66,25 @@ Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
   return result;
 }
 
+void map2car(double px, double py, double psi, 
+                          vector<double> ptsx, vector<double> ptsy, 
+                          Eigen::VectorXd &veh_ptsx, Eigen::VectorXd &veh_ptsy){
+    Eigen::Matrix3d tran;
+    Eigen::Vector3d map_coord, veh_coord;
+    double dx, dy;
+    
+    tran << cos(psi), -sin(psi), px,
+            sin(psi), cos(psi), py,
+            0, 0, 1;
+    for(unsigned int i = 0; i < ptsx.size(); i++) {
+        dx = ptsx[i] - px;
+        dy = ptsy[i] - py;
+        double neg_psi = -1*psi;
+        veh_ptsx[i] = dx * cos( neg_psi ) - dy * sin( neg_psi );
+        veh_ptsy[i] = dx * sin( neg_psi ) + dy * cos( neg_psi );
+    }
+}
+
 int main() {
   uWS::Hub h;
 
@@ -91,15 +111,49 @@ int main() {
           double py = j[1]["y"];
           double psi = j[1]["psi"];
           double v = j[1]["speed"];
+          
+          double delta = j[1]["steering_angle"];
+          double a = j[1]["throttle"];
 
+          // Convert map coordinates to vehicle coordinates
+          Eigen::VectorXd veh_ptsx(ptsx.size());
+          Eigen::VectorXd veh_ptsy(ptsy.size());
+          // the following call converts the waypoints ptsx and ptsy to vehicle CS
+          map2car(px, py, psi, ptsx, ptsy, veh_ptsx, veh_ptsy);
+          
           /*
           * TODO: Calculate steering angle and throttle using MPC.
           *
           * Both are in between [-1, 1].
           *
           */
-          double steer_value;
-          double throttle_value;
+          // Calculate coefficient of cubic spline through waypoints in vehicle CS
+          Eigen::VectorXd coeff = polyfit(veh_ptsx, veh_ptsy, 3);
+          double cte0 = coeff[0];
+          double epsi0 = -atan(coeff[1]);
+          
+          // Actuator delay in milliseconds.
+          const int actuatorDelay =  100;
+
+          // Actuator delay in seconds.
+          const double delay = actuatorDelay / 1000.0;
+          
+          // State after delay.
+          double Lf = 2.67;
+          double x_delay = 0 + ( v * cos(0) * delay );
+          double y_delay = 0 + ( v * sin(0) * delay );
+          double psi_delay = 0 - ( v * delta * delay / Lf );
+          double v_delay = v + a * delay;
+          double cte_delay = cte0 + ( v * sin(0) * delay );
+          double epsi_delay = epsi0 - ( v * atan(coeff[1]) * delay / Lf );
+          
+          Eigen::VectorXd state(6);
+          state << x_delay, y_delay, psi_delay, v_delay, cte_delay, epsi_delay;
+          
+          MPC_Control mpc_sol = mpc.Solve(state, coeff);
+          
+          double steer_value = mpc_sol.delta / deg2rad(25);
+          double throttle_value = mpc_sol.a;
 
           json msgJson;
           // NOTE: Remember to divide by deg2rad(25) before you send the steering value back.
@@ -114,8 +168,8 @@ int main() {
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Green line
 
-          msgJson["mpc_x"] = mpc_x_vals;
-          msgJson["mpc_y"] = mpc_y_vals;
+          msgJson["mpc_x"] = mpc_sol.xpts;
+          msgJson["mpc_y"] = mpc_sol.ypts;
 
           //Display the waypoints/reference line
           vector<double> next_x_vals;
@@ -123,9 +177,16 @@ int main() {
 
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Yellow line
-
-          msgJson["next_x"] = next_x_vals;
-          msgJson["next_y"] = next_y_vals;
+          
+          vector<double> v_veh_ptsx;
+          vector<double> v_veh_ptsy;
+          v_veh_ptsx.resize(veh_ptsx.size());
+          v_veh_ptsy.resize(veh_ptsy.size());
+          
+          Eigen::VectorXd::Map(&v_veh_ptsx[0], veh_ptsx.size()) = veh_ptsx;
+          Eigen::VectorXd::Map(&v_veh_ptsy[0], veh_ptsy.size()) = veh_ptsy;
+          msgJson["next_x"] = v_veh_ptsx;
+          msgJson["next_y"] = v_veh_ptsy;
 
 
           auto msg = "42[\"steer\"," + msgJson.dump() + "]";
